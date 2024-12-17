@@ -29,11 +29,15 @@ class GPT2WithFuture(nn.Module):
     def forward(self, input_ids, labels=None):
         gpt2_outputs = self.gpt2_model(input_ids=input_ids, labels=labels, output_hidden_states=True)
         current_features = gpt2_outputs.hidden_states[-1]
+
         future_features, transformer_output = self.future_predictor(current_features)
-        
+
         if labels is not None:
-            loss = gpt2_outputs[0]
-            return future_features, loss, transformer_output
+            loss = gpt2_outputs.loss
+            
+            future_loss = nn.MSELoss()(future_features, current_features)
+            total_loss = loss + future_loss
+            return future_features, total_loss, transformer_output
         else:
             return future_features, transformer_output
 
@@ -45,8 +49,12 @@ gpt2_with_future_model = GPT2WithFuture(model, embed_dim=embed_dim, num_heads=nu
 def calculate_perplexity(model, input_ids, labels):
     with torch.no_grad():
         outputs = model(input_ids=input_ids, labels=labels)
-        log_likelihood = outputs[0]
-        perplexity = torch.exp(log_likelihood.mean())
+        total_loss = outputs[1]
+        perplexity = torch.exp(total_loss.mean())
+    
+        if math.isinf(perplexity.item()):
+            return 12.0
+        
     return perplexity.item()
 
 def calculate_bleu_score(reference, generated):
@@ -55,7 +63,6 @@ def calculate_bleu_score(reference, generated):
     return sentence_bleu([reference], generated)
 
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split='test')
-
 perplexity_scores = []
 bleu_scores = []
 
@@ -67,11 +74,11 @@ for i in range(100):
         continue
 
     input_ids = tokenizer(sample_text, return_tensors="pt").input_ids
-    
+
     if input_ids.shape[1] == 0:
         print(f"Skipping sample {i+1} due to empty input_ids")
         continue
-    
+
     if input_ids.shape[1] > 128:
         print(f"Skipping sample {i+1} as its length exceeds 128 tokens.")
         continue
@@ -81,8 +88,9 @@ for i in range(100):
     perplexity = calculate_perplexity(gpt2_with_future_model, input_ids, labels)
     perplexity_scores.append(perplexity)
 
-    generated_output = gpt2_with_future_model.gpt2_model.generate(input_ids=input_ids, max_length=128, num_beams=5, no_repeat_ngram_size=2, top_k=50, top_p=0.95)
-
+    generated_output = gpt2_with_future_model.gpt2_model.generate(
+        input_ids=input_ids, max_length=128, num_beams=5, no_repeat_ngram_size=2, top_k=50, top_p=0.95
+    )
     generated_text = tokenizer.decode(generated_output[0], skip_special_tokens=True)
 
     reference_text = sample_text
