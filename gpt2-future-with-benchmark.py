@@ -1,6 +1,6 @@
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
 import torch
 import torch.nn as nn
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from datasets import load_dataset
 from nltk.translate.bleu_score import sentence_bleu
 import math
@@ -29,33 +29,37 @@ class GPT2WithFuture(nn.Module):
     def forward(self, input_ids, labels=None):
         gpt2_outputs = self.gpt2_model(input_ids=input_ids, labels=labels, output_hidden_states=True)
         current_features = gpt2_outputs.hidden_states[-1]
-
         future_features, transformer_output = self.future_predictor(current_features)
-
         if labels is not None:
             loss = gpt2_outputs.loss
-            
             future_loss = nn.MSELoss()(future_features, current_features)
             total_loss = loss + future_loss
             return future_features, total_loss, transformer_output
         else:
             return future_features, transformer_output
 
+    def generate_with_future(self, input_ids, max_length=128):
+        generated_ids = input_ids.clone()
+        for _ in range(max_length - input_ids.shape[1]):
+            gpt2_outputs = self.gpt2_model(input_ids=generated_ids, output_hidden_states=True)
+            current_features = gpt2_outputs.hidden_states[-1]
+            future_features, _ = self.future_predictor(current_features)
+            combined_features = current_features + 0.5 * future_features
+            logits = self.gpt2_model.lm_head(combined_features[:, -1, :])
+            next_token = torch.argmax(logits, dim=-1).unsqueeze(0)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+        return generated_ids
+
 embed_dim = 768
 num_heads = 12
-num_layers = 12
+num_layers = 4
 gpt2_with_future_model = GPT2WithFuture(model, embed_dim=embed_dim, num_heads=num_heads, num_layers=num_layers)
 
 def calculate_perplexity(model, input_ids, labels):
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, labels=labels)
-        total_loss = outputs[1]
+        _, total_loss, _ = model(input_ids=input_ids, labels=labels)
         perplexity = torch.exp(total_loss.mean())
-    
-        if math.isinf(perplexity.item()):
-            return 12.0
-        
-    return perplexity.item()
+        return perplexity.item()
 
 def calculate_bleu_score(reference, generated):
     reference = reference.split()
@@ -68,43 +72,17 @@ bleu_scores = []
 
 for i in range(100):
     sample_text = dataset[i]['text']
-
-    if len(sample_text) < 25:
-        print(f"Skipping sample {i+1} as its length is less than 25 characters.")
+    if len(sample_text) < 25 or tokenizer(sample_text, return_tensors="pt").input_ids.shape[1] > 128:
         continue
-
     input_ids = tokenizer(sample_text, return_tensors="pt").input_ids
-
-    if input_ids.shape[1] == 0:
-        print(f"Skipping sample {i+1} due to empty input_ids")
-        continue
-
-    if input_ids.shape[1] > 128:
-        print(f"Skipping sample {i+1} as its length exceeds 128 tokens.")
-        continue
-
     labels = input_ids.clone()
-
     perplexity = calculate_perplexity(gpt2_with_future_model, input_ids, labels)
     perplexity_scores.append(perplexity)
-
-    generated_output = gpt2_with_future_model.gpt2_model.generate(
-        input_ids=input_ids, max_length=128, num_beams=5, no_repeat_ngram_size=2, top_k=50, top_p=0.95
-    )
+    generated_output = gpt2_with_future_model.generate_with_future(input_ids, max_length=128)
     generated_text = tokenizer.decode(generated_output[0], skip_special_tokens=True)
-
-    reference_text = sample_text
-    bleu_score_value = calculate_bleu_score(reference_text, generated_text)
-    bleu_scores.append(bleu_score_value)
-
-    print(f"Sample {i + 1}:")
-    print(f"Generated Text: {generated_text}")
-    print(f"Perplexity: {perplexity}")
-    print(f"BLEU Score: {bleu_score_value}")
-    print("-" * 50)
+    bleu_scores.append(calculate_bleu_score(sample_text, generated_text))
 
 average_perplexity = sum(perplexity_scores) / len(perplexity_scores)
 average_bleu_score = sum(bleu_scores) / len(bleu_scores)
-
 print(f"Average Perplexity: {average_perplexity}")
 print(f"Average BLEU Score: {average_bleu_score}")
